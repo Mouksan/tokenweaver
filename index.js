@@ -81,11 +81,13 @@ let pendingPromptInfo = null;
 // --- Модули таверны, которые грузим динамически (если их нет — работаем без них) ---
 let stTokenizers = null;
 let stOpenAI = null;
+let stExtensions = null;
 
 // --- Окно ---
 let panel = null;
 let panelOpen = false;
 let activeTab = "breakdown";
+let editingNameKeys = null; // пока переименовываем строку разбивки, окно не перерисовываем
 
 const defaultSettings = {
     enabled: true,
@@ -104,6 +106,7 @@ const defaultSettings = {
     showSideOnIndicator: true,
     historySize: 5,
     excludedSources: [], // [{ path: "third-party/Frameweaver", label: "Frameweaver" }]
+    injectionNames: {},  // { "third-party/lifeweaver_sys": "Lifeweaver" } — ручные имена инъекций
     showHiddenCounter: true,
     hiddenCounterPosition: "below",
     freePosition: null,
@@ -155,6 +158,7 @@ async function loadSettings() {
     const settings = extension_settings[extensionName];
     settings.historySize = clampHistorySize(settings.historySize);
     if (!Array.isArray(settings.excludedSources)) settings.excludedSources = [];
+    if (!settings.injectionNames || typeof settings.injectionNames !== "object") settings.injectionNames = {};
 
     $("#tkw_enabled").prop("checked", settings.enabled);
     $("#tkw_position").val(settings.position);
@@ -499,7 +503,12 @@ function openPanel() {
             </div>
         `);
         panel.on("click", ".tkw-panel-close", closePanel);
+        panel.on("click", ".tkw-bd-edit", function (e) {
+            e.stopPropagation();
+            startRename($(this).closest(".tkw-bd-line"));
+        });
         panel.on("click", ".tkw-tab", function () {
+            editingNameKeys = null;
             activeTab = String($(this).data("tab"));
             panel.find(".tkw-panel-body").scrollTop(0);
             renderPanel();
@@ -588,6 +597,7 @@ function renderEntryDetails(entry) {
 
 function renderPanel() {
     if (!panelOpen || !panel) return;
+    if (activeTab === "breakdown" && editingNameKeys) return;
     panel.find(".tkw-tab").each(function () {
         $(this).toggleClass("tkw-tab-active", $(this).data("tab") === activeTab);
     });
@@ -625,22 +635,114 @@ function renderBreakdown(body) {
         return;
     }
 
-    const lines = lastBreakdown.lines.map(line => `
-        <div class="tkw-bd-line ${line.kind === "extension" ? "tkw-bd-ext" : ""}">
+    const total = lastBreakdown.total;
+    const tokensCell = (tokens) => `
+        <span class="tkw-bd-tokens">${tokens}<span class="tkw-bd-pct"> · ${formatPercent(tokens, total)}</span></span>`;
+
+    const baseLines = lastBreakdown.baseLines.map(line => `
+        <div class="tkw-bd-line">
             <span class="tkw-bd-label">
                 ${escapeHtml(line.label)}
                 ${line.note ? `<span class="tkw-bd-note">${escapeHtml(line.note)}</span>` : ""}
             </span>
-            <span class="tkw-bd-tokens">${line.tokens}</span>
+            ${tokensCell(line.tokens)}
         </div>`).join("");
+
+    const extensionLines = groupExtensionItems(lastBreakdown.extensionItems).map(group => {
+        const keysTitle = (group.keys.length > 1 ? "Ключи: " : "Ключ: ") + group.keys.join(", ");
+        return `
+        <div class="tkw-bd-line tkw-bd-ext" data-keys="${escapeHtml(JSON.stringify(group.keys))}">
+            <span class="tkw-bd-label" title="${escapeHtml(keysTitle)}">${escapeHtml(group.label)}</span>
+            <span class="tkw-bd-right">
+                <span class="tkw-bd-edit fa-solid fa-pencil" title="Переименовать"></span>
+                ${tokensCell(group.tokens)}
+            </span>
+        </div>`;
+    }).join("");
 
     const other = lastBreakdown.other > 0 ? `
         <div class="tkw-bd-line tkw-bd-other">
             <span class="tkw-bd-label">Прочее</span>
-            <span class="tkw-bd-tokens">${lastBreakdown.other}</span>
+            ${tokensCell(lastBreakdown.other)}
         </div>` : "";
 
-    body.html(totalLine + lines + other);
+    body.html(totalLine + baseLines + extensionLines + other);
+}
+
+function formatPercent(tokens, total) {
+    if (!total || tokens <= 0) return "0%";
+    const pct = (tokens / total) * 100;
+    return pct < 1 ? "<1%" : `${Math.round(pct)}%`;
+}
+
+// Склеиваем инъекции с одинаковым итоговым именем (ручное имя важнее автоматического).
+function groupExtensionItems(items) {
+    const names = extension_settings[extensionName].injectionNames || {};
+    const groups = new Map();
+    for (const item of items) {
+        const label = names[item.key] || item.autoLabel;
+        if (!groups.has(label)) groups.set(label, { label, tokens: 0, keys: [] });
+        const group = groups.get(label);
+        group.tokens += item.tokens;
+        group.keys.push(item.key);
+    }
+    return [...groups.values()]
+        .filter(group => group.tokens > 0)
+        .sort((a, b) => b.tokens - a.tokens);
+}
+
+// --- Переименование строки разбивки ---
+
+function startRename(line) {
+    let keys;
+    try {
+        keys = JSON.parse(line.attr("data-keys") || "[]");
+    } catch {
+        return;
+    }
+    if (!Array.isArray(keys) || !keys.length) return;
+
+    const labelEl = line.find(".tkw-bd-label");
+    const input = $('<input type="text" class="text_pole tkw-bd-input" />').val(labelEl.text().trim());
+    editingNameKeys = keys;
+    labelEl.replaceWith(input);
+    line.find(".tkw-bd-edit").hide();
+    input.trigger("focus").trigger("select");
+
+    input.on("keydown", (e) => {
+        if (e.key === "Enter") {
+            e.preventDefault();
+            e.stopPropagation();
+            finishRename(String(input.val() || ""));
+        } else if (e.key === "Escape") {
+            e.preventDefault();
+            e.stopPropagation();
+            cancelRename();
+        }
+    });
+    input.on("blur", () => {
+        if (editingNameKeys) cancelRename();
+    });
+}
+
+function finishRename(value) {
+    const keys = editingNameKeys;
+    editingNameKeys = null;
+    if (!keys) return;
+
+    const name = value.trim();
+    const names = extension_settings[extensionName].injectionNames;
+    for (const key of keys) {
+        if (name) names[key] = name;
+        else delete names[key]; // пустое имя — вернуть автоматическое
+    }
+    saveSettingsDebounced();
+    renderPanel();
+}
+
+function cancelRename() {
+    editingNameKeys = null;
+    renderPanel();
 }
 
 function renderHistory(body) {
@@ -1003,7 +1105,46 @@ function classifyExtensionPrompt(key) {
     if (key === "DEPTH_PROMPT" || /^DEPTH_PROMPT_\d+$/.test(key) || key === "PERSONA_DESCRIPTION" || key === "__STORY_STRING__") {
         return { kind: "card" };
     }
-    return { kind: "extension", label: BUILTIN_EXTENSION_LABELS[key] || key };
+    return { kind: "extension" };
+}
+
+// Ищем установленное расширение, чьё имя папки — начало ключа: "third-party/lifeweaver_sys" → lifeweaver + "sys".
+function matchInstalledExtension(key) {
+    const names = Array.isArray(stExtensions?.extensionNames) ? stExtensions.extensionNames : [];
+    const lowerKey = key.toLowerCase();
+    let best = null;
+
+    for (const name of names) {
+        const folder = String(name).split("/").pop();
+        for (const candidate of [String(name), folder]) {
+            const lower = candidate.toLowerCase();
+            if (lower.length < 3 || !lowerKey.startsWith(lower)) continue;
+            const next = key.charAt(lower.length);
+            if (next && /[a-z0-9]/i.test(next)) continue; // "lifeweaverx" — не то расширение
+            if (!best || lower.length > best.length) {
+                best = { path: String(name), length: lower.length };
+            }
+        }
+    }
+
+    if (!best) return null;
+    const suffix = key.slice(best.length).replace(/^[^a-z0-9]+/i, "");
+    return { path: best.path, suffix };
+}
+
+async function resolveInjectionLabel(key) {
+    if (BUILTIN_EXTENSION_LABELS[key]) return BUILTIN_EXTENSION_LABELS[key];
+
+    const inject = key.match(/^script_inject_(.+)$/);
+    if (inject) return `/inject: ${inject[1]}`;
+
+    const match = matchInstalledExtension(key);
+    if (match) {
+        const label = await getExtensionLabel(match.path);
+        return match.suffix ? `${label} (${match.suffix})` : label;
+    }
+
+    return key;
 }
 
 // Раскладываем основной запрос по корзинкам. Каждый блок попадает ровно в одну строку.
@@ -1021,7 +1162,7 @@ async function computeBreakdown(snapshot, total) {
 
     // Инъекции: «в промт» таверна вклеивает внутрь главного блока пресета, «на глубине» — в историю.
     // Поэтому их размер вычитаем оттуда, куда они вклеены, и показываем отдельно.
-    const extensions = new Map();
+    const extensionItems = [];
     for (const prompt of snapshot.extensionPrompts) {
         if (![EXT_POSITION.IN_PROMPT, EXT_POSITION.IN_CHAT, EXT_POSITION.BEFORE_PROMPT].includes(prompt.position)) continue;
 
@@ -1042,32 +1183,27 @@ async function computeBreakdown(snapshot, total) {
 
         if (target.kind === "card") card += tokens;
         else if (target.kind === "lore") lore += tokens;
-        else extensions.set(target.label, (extensions.get(target.label) || 0) + tokens);
+        else extensionItems.push({ key: prompt.key, tokens, autoLabel: await resolveInjectionLabel(prompt.key) });
     }
 
     preset = Math.max(0, preset);
     history = Math.max(0, history);
 
-    const lines = [];
-    if (preset > 0) lines.push({ kind: "base", label: "Пресет", tokens: preset });
-    if (card > 0) lines.push({ kind: "base", label: "Карточка", tokens: card });
-    if (lore > 0) lines.push({ kind: "base", label: "Лорбук", tokens: lore });
+    const baseLines = [];
+    if (preset > 0) baseLines.push({ label: "Пресет", tokens: preset });
+    if (card > 0) baseLines.push({ label: "Карточка", tokens: card });
+    if (lore > 0) baseLines.push({ label: "Лорбук", tokens: lore });
     if (history > 0) {
-        lines.push({
-            kind: "base",
+        baseLines.push({
             label: "История чата",
             tokens: history,
             note: snapshot.messagesInContext !== null ? `сообщений чата: ${snapshot.messagesInContext}` : "",
         });
     }
 
-    [...extensions.entries()]
-        .filter(([, tokens]) => tokens > 0)
-        .sort((a, b) => b[1] - a[1])
-        .forEach(([label, tokens]) => lines.push({ kind: "extension", label, tokens }));
-
-    const sum = lines.reduce((acc, line) => acc + line.tokens, 0);
-    return { lines, other: total - sum };
+    const sum = baseLines.reduce((acc, line) => acc + line.tokens, 0)
+        + extensionItems.reduce((acc, item) => acc + Math.max(0, item.tokens), 0);
+    return { baseLines, extensionItems, other: total - sum };
 }
 
 async function finishMainBreakdown(snapshot, total, epoch) {
@@ -1076,9 +1212,9 @@ async function finishMainBreakdown(snapshot, total, epoch) {
             if (epoch === mainEpoch) lastBreakdown = { epoch, status: "unsupported", total };
             return;
         }
-        const { lines, other } = await computeBreakdown(snapshot, total);
+        const { baseLines, extensionItems, other } = await computeBreakdown(snapshot, total);
         if (epoch !== mainEpoch) return;
-        lastBreakdown = { epoch, status: "ready", total, lines, other };
+        lastBreakdown = { epoch, status: "ready", total, baseLines, extensionItems, other };
     } catch (e) {
         console.error(LOG, "Breakdown failed:", e);
         if (epoch === mainEpoch) lastBreakdown = { epoch, status: "unsupported", total };
@@ -1336,6 +1472,11 @@ async function loadStModules() {
         stTokenizers = await import("../../../tokenizers.js");
     } catch (e) {
         console.warn(LOG, "Could not load tokenizers module, falling back to plain counting:", e);
+    }
+    try {
+        stExtensions = await import("../../../extensions.js");
+    } catch (e) {
+        console.warn(LOG, "Could not load extensions module, injection names will be raw keys:", e);
     }
     try {
         stOpenAI = await import("../../../openai.js");
