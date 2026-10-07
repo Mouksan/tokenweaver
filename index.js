@@ -29,6 +29,23 @@ const ROLE_LABELS = {
     prompt: "промт",
 };
 
+// Подписи встроенных инъекций таверны в разбивке.
+const BUILTIN_EXTENSION_LABELS = {
+    "1_memory": "Сводка",
+    "2_floating_prompt": "Заметка автора",
+    "3_vectors": "Векторы чата",
+    "4_vectors_data_bank": "Векторы банка данных",
+    "chromadb": "Smart Context",
+};
+
+// Блоки Prompt Manager, которые относятся к карточке и лорбуку. Всё остальное — пресет.
+const CARD_PROMPT_IDS = ["charDescription", "charPersonality", "scenario", "personaDescription", "dialogueExamples"];
+const LORE_PROMPT_IDS = ["worldInfoBefore", "worldInfoAfter"];
+const HISTORY_PROMPT_ID = "chatHistory";
+
+// Позиции инъекций (extension_prompt_types в таверне).
+const EXT_POSITION = { NONE: -1, IN_PROMPT: 0, IN_CHAT: 1, BEFORE_PROMPT: 2 };
+
 const MAIN_SOURCE_LABEL = "Основной ответ";
 const UNKNOWN_SOURCE_LABEL = "Неизвестно";
 
@@ -55,9 +72,17 @@ let entryCounter = 0;
 const expandedEntries = new Set();
 const extensionLabelCache = new Map(); // путь папки -> Promise<string>
 
+// --- Разбивка последнего основного запроса ---
+let lastBreakdown = null; // { epoch, status: "counting" | "ready" | "unsupported", total, lines, other, messagesInContext }
+
+// --- Модули таверны, которые грузим динамически (если их нет — работаем без них) ---
+let stTokenizers = null;
+let stOpenAI = null;
+
 // --- Окно ---
 let panel = null;
 let panelOpen = false;
+let activeTab = "breakdown";
 
 const defaultSettings = {
     enabled: true,
@@ -388,6 +413,12 @@ function applyStyles() {
     }
 }
 
+function getMaxTokens() {
+    const settings = extension_settings[extensionName];
+    if (settings.useCustomMax) return settings.customMax || 32000;
+    return getContext()?.maxContext || 0;
+}
+
 function updateContextDisplay() {
     const settings = extension_settings[extensionName];
     if (!settings?.enabled || !contextIndicator) return;
@@ -396,7 +427,7 @@ function updateContextDisplay() {
     if (!context) return;
 
     const usedTokens = lastMainTokens;
-    const maxTokens = settings.useCustomMax ? (settings.customMax || 32000) : (context.maxContext || 0);
+    const maxTokens = getMaxTokens();
 
     messageStats = countMessages();
 
@@ -458,12 +489,18 @@ function openPanel() {
                     <div class="tkw-panel-close fa-solid fa-xmark" title="Закрыть"></div>
                 </div>
                 <div class="tkw-tabs">
-                    <div class="tkw-tab tkw-tab-active" data-tab="history">История</div>
+                    <div class="tkw-tab" data-tab="breakdown">Разбивка</div>
+                    <div class="tkw-tab" data-tab="history">История</div>
                 </div>
                 <div class="tkw-panel-body"></div>
             </div>
         `);
         panel.on("click", ".tkw-panel-close", closePanel);
+        panel.on("click", ".tkw-tab", function () {
+            activeTab = String($(this).data("tab"));
+            panel.find(".tkw-panel-body").scrollTop(0);
+            renderPanel();
+        });
         panel.on("click", ".tkw-row-exclude", function (e) {
             e.stopPropagation();
             const id = Number($(this).closest(".tkw-row").data("id"));
@@ -548,9 +585,62 @@ function renderEntryDetails(entry) {
 
 function renderPanel() {
     if (!panelOpen || !panel) return;
+    panel.find(".tkw-tab").each(function () {
+        $(this).toggleClass("tkw-tab-active", $(this).data("tab") === activeTab);
+    });
+
     const body = panel.find(".tkw-panel-body");
     const scrollTop = body.scrollTop();
 
+    if (activeTab === "breakdown") renderBreakdown(body);
+    else renderHistory(body);
+
+    body.scrollTop(scrollTop);
+}
+
+function renderBreakdown(body) {
+    const max = getMaxTokens();
+
+    if (!lastBreakdown) {
+        body.html('<div class="tkw-empty">Основного запроса пока не было — сгенерируй что-нибудь</div>');
+        return;
+    }
+
+    if (lastBreakdown.status === "counting") {
+        body.html('<div class="tkw-empty">Считаю…</div>');
+        return;
+    }
+
+    const totalLine = `
+        <div class="tkw-bd-total">
+            <span>Всего</span>
+            <span class="tkw-bd-tokens">${lastBreakdown.total} / ${max}</span>
+        </div>`;
+
+    if (lastBreakdown.status === "unsupported") {
+        body.html(totalLine + '<div class="tkw-empty">Разбивка доступна только для Chat Completion</div>');
+        return;
+    }
+
+    const lines = lastBreakdown.lines.map(line => `
+        <div class="tkw-bd-line ${line.kind === "extension" ? "tkw-bd-ext" : ""}">
+            <span class="tkw-bd-label">
+                ${escapeHtml(line.label)}
+                ${line.note ? `<span class="tkw-bd-note">${escapeHtml(line.note)}</span>` : ""}
+            </span>
+            <span class="tkw-bd-tokens">${line.tokens}</span>
+        </div>`).join("");
+
+    const other = lastBreakdown.other > 0 ? `
+        <div class="tkw-bd-line tkw-bd-other">
+            <span class="tkw-bd-label">Прочее</span>
+            <span class="tkw-bd-tokens">${lastBreakdown.other}</span>
+        </div>` : "";
+
+    body.html(totalLine + lines + other);
+}
+
+function renderHistory(body) {
     if (requestHistory.length === 0) {
         body.html('<div class="tkw-empty">Запросов пока не было — сгенерируй что-нибудь</div>');
         return;
@@ -574,7 +664,6 @@ function renderPanel() {
     }).join("");
 
     body.html(html);
-    body.scrollTop(scrollTop);
 }
 
 function toggleEntry(id) {
@@ -737,6 +826,7 @@ function extractRequestMessages(data) {
     if (Array.isArray(data?.messages)) {
         return data.messages.map(message => ({
             role: String(message?.role || ""),
+            name: typeof message?.name === "string" ? message.name : undefined,
             text: messageText(message),
             tokens: null,
         }));
@@ -816,6 +906,147 @@ async function countTokens(text) {
     return 0;
 }
 
+// Chat Completion: считаем каждое сообщение тем же способом, что и Prompt Manager.
+// Таверна уже посчитала эти сообщения при сборке промта, так что почти всё берётся из её кэша,
+// а итог совпадает с «Total Tokens» в Prompt Manager.
+async function countChatMessages(messages) {
+    const countFn = stTokenizers?.countTokensOpenAIAsync;
+    let total = 0;
+    for (const message of messages) {
+        if (!message.text) {
+            message.tokens = 0;
+            continue;
+        }
+        if (typeof countFn === "function") {
+            const payload = { role: message.role, content: message.text };
+            if (message.name !== undefined) payload.name = message.name;
+            message.tokens = await countFn(payload);
+        } else {
+            message.tokens = await countTokens(message.text);
+        }
+        total += message.tokens;
+    }
+    return total;
+}
+
+// Снимок того, что таверна знала о промте в момент отправки основного запроса.
+function snapshotPromptState() {
+    try {
+        const context = getContext();
+        if (context?.mainApi !== "openai") return null;
+
+        const counts = stOpenAI?.promptManager?.tokenHandler?.getCounts?.();
+        if (!counts) return null;
+
+        const extensionPrompts = Object.entries(context.extensionPrompts || {})
+            .filter(([, prompt]) => prompt && typeof prompt.value === "string" && prompt.value.trim())
+            .map(([key, prompt]) => ({
+                key,
+                value: prompt.value,
+                position: Number(prompt.position),
+                filter: typeof prompt.filter === "function" ? prompt.filter : null,
+            }));
+
+        const messagesInContext = typeof stOpenAI?.openai_messages_count === "number" ? stOpenAI.openai_messages_count : null;
+
+        return { counts: { ...counts }, extensionPrompts, messagesInContext };
+    } catch (e) {
+        console.error(LOG, "Prompt snapshot failed:", e);
+        return null;
+    }
+}
+
+// Куда отнести инъекцию: карточка, лорбук, отдельное расширение или пропустить.
+function classifyExtensionPrompt(key) {
+    if (key === "QUIET_PROMPT" || key.startsWith("customWIOutlet_")) return { kind: "skip" };
+    if (key.startsWith("customDepthWI")) return { kind: "lore" };
+    if (key === "DEPTH_PROMPT" || /^DEPTH_PROMPT_\d+$/.test(key) || key === "PERSONA_DESCRIPTION" || key === "__STORY_STRING__") {
+        return { kind: "card" };
+    }
+    return { kind: "extension", label: BUILTIN_EXTENSION_LABELS[key] || key };
+}
+
+// Раскладываем основной запрос по корзинкам. Каждый блок попадает ровно в одну строку.
+async function computeBreakdown(snapshot, total) {
+    let preset = 0, card = 0, lore = 0, history = 0;
+
+    for (const [id, value] of Object.entries(snapshot.counts)) {
+        const n = Number(value) || 0;
+        if (n <= 0) continue;
+        if (id === HISTORY_PROMPT_ID) history += n;
+        else if (CARD_PROMPT_IDS.includes(id)) card += n;
+        else if (LORE_PROMPT_IDS.includes(id)) lore += n;
+        else preset += n;
+    }
+
+    // Инъекции: «в промт» таверна вклеивает внутрь главного блока пресета, «на глубине» — в историю.
+    // Поэтому их размер вычитаем оттуда, куда они вклеены, и показываем отдельно.
+    const extensions = new Map();
+    for (const prompt of snapshot.extensionPrompts) {
+        if (![EXT_POSITION.IN_PROMPT, EXT_POSITION.IN_CHAT, EXT_POSITION.BEFORE_PROMPT].includes(prompt.position)) continue;
+
+        const target = classifyExtensionPrompt(prompt.key);
+        if (target.kind === "skip") continue;
+
+        if (prompt.filter) {
+            try {
+                if (!await prompt.filter()) continue;
+            } catch {
+                continue;
+            }
+        }
+
+        const tokens = await countTokens(prompt.value);
+        if (prompt.position === EXT_POSITION.IN_CHAT) history -= tokens;
+        else preset -= tokens;
+
+        if (target.kind === "card") card += tokens;
+        else if (target.kind === "lore") lore += tokens;
+        else extensions.set(target.label, (extensions.get(target.label) || 0) + tokens);
+    }
+
+    preset = Math.max(0, preset);
+    history = Math.max(0, history);
+
+    const lines = [];
+    if (preset > 0) lines.push({ kind: "base", label: "Пресет", tokens: preset });
+    if (card > 0) lines.push({ kind: "base", label: "Карточка", tokens: card });
+    if (lore > 0) lines.push({ kind: "base", label: "Лорбук", tokens: lore });
+    if (history > 0) {
+        lines.push({
+            kind: "base",
+            label: "История чата",
+            tokens: history,
+            note: snapshot.messagesInContext !== null ? `сообщений в контексте: ${snapshot.messagesInContext}` : "",
+        });
+    }
+
+    [...extensions.entries()]
+        .filter(([, tokens]) => tokens > 0)
+        .sort((a, b) => b[1] - a[1])
+        .forEach(([label, tokens]) => lines.push({ kind: "extension", label, tokens }));
+
+    const sum = lines.reduce((acc, line) => acc + line.tokens, 0);
+    return { lines, other: total - sum };
+}
+
+async function finishMainBreakdown(snapshot, total, epoch) {
+    try {
+        if (!snapshot) {
+            if (epoch === mainEpoch) lastBreakdown = { epoch, status: "unsupported", total };
+            return;
+        }
+        const { lines, other } = await computeBreakdown(snapshot, total);
+        if (epoch !== mainEpoch) return;
+        lastBreakdown = { epoch, status: "ready", total, lines, other };
+    } catch (e) {
+        console.error(LOG, "Breakdown failed:", e);
+        if (epoch === mainEpoch) lastBreakdown = { epoch, status: "unsupported", total };
+    } finally {
+        renderPanel();
+    }
+}
+
 function inspectRequest(args) {
     const url = getRequestUrl(args[0]);
     if (!isGenerationUrl(url)) return;
@@ -832,7 +1063,7 @@ function inspectRequest(args) {
 
     const messages = extractRequestMessages(data);
     if (messages === null) return;
-    const text = messages.map(m => m.text).join("\n");
+    const isChatCompletion = Array.isArray(data?.messages);
 
     // Стек снимаем сразу, синхронно — пока видно, кто нас вызвал.
     const stack = captureStack();
@@ -868,20 +1099,36 @@ function inspectRequest(args) {
 
     console.debug(LOG, isMain ? "main request" : "side request", { url, via, source: sourcePath });
 
+    // Снимок промта берём синхронно, пока таверна не пересчитала его для чего-нибудь ещё.
+    const snapshot = isMain && isChatCompletion ? snapshotPromptState() : null;
+
     const epoch = isMain ? ++mainEpoch : mainEpoch;
     if (isMain) {
         mainGenerationActive = false;
         sideTokensSinceMain = 0;
+        lastBreakdown = { epoch, status: "counting" };
         updateContextDisplay();
+        renderPanel();
     }
 
-    countTokens(text).then(tokens => {
+    const counting = isChatCompletion
+        ? countChatMessages(messages).then(total => {
+            entry.messagesCounted = true;
+            return total;
+        })
+        : countTokens(messages.map(m => m.text).join("\n"));
+
+    counting.then(tokens => {
         entry.totalTokens = tokens;
         renderPanel();
 
         if (epoch !== mainEpoch) return; // уже пришёл более свежий основной запрос / сменился чат
-        if (isMain) lastMainTokens = tokens;
-        else sideTokensSinceMain += tokens;
+        if (isMain) {
+            lastMainTokens = tokens;
+            finishMainBreakdown(snapshot, tokens, epoch);
+        } else {
+            sideTokensSinceMain += tokens;
+        }
         updateContextDisplay();
     }).catch(e => console.error(LOG, "Token count failed:", e));
 }
@@ -1025,10 +1272,12 @@ function bindEvents() {
         if (RESET_ON_CHAT_CHANGED) {
             lastMainTokens = 0;
             sideTokensSinceMain = 0;
+            lastBreakdown = null;
             mainEpoch++; // недосчитанные запросы прошлого чата не долетят до табло
         }
         mainGenerationActive = false;
         updateContextDisplay();
+        renderPanel();
         startChatObserver();
     });
 
@@ -1038,12 +1287,26 @@ function bindEvents() {
     });
 }
 
+async function loadStModules() {
+    try {
+        stTokenizers = await import("../../../tokenizers.js");
+    } catch (e) {
+        console.warn(LOG, "Could not load tokenizers module, falling back to plain counting:", e);
+    }
+    try {
+        stOpenAI = await import("../../../openai.js");
+    } catch (e) {
+        console.warn(LOG, "Could not load openai module, breakdown will be unavailable:", e);
+    }
+}
+
 jQuery(async () => {
     try {
         const settingsHtml = await $.get(new URL("settings.html", import.meta.url).href);
         $("#extensions_settings2").append(settingsHtml);
 
         await loadSettings();
+        await loadStModules();
         installFetchInterceptor();
         bindSettingsHandlers();
         bindEvents();

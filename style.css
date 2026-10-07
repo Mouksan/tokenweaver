@@ -291,3 +291,52 @@
     margin: 0;
     padding: 2px 10px;
 }
+
+/* =====================================================================
+   Вкладка «Разбивка»
+   ===================================================================== */
+
+.tkw-bd-total,
+.tkw-bd-line {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 5px 6px;
+}
+
+.tkw-bd-total {
+    font-weight: 600;
+    font-size: 14px;
+    border-bottom: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.1));
+    margin-bottom: 4px;
+    padding-bottom: 8px;
+}
+
+.tkw-bd-label {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.tkw-bd-note {
+    margin-left: 6px;
+    font-size: 11px;
+    opacity: 0.5;
+}
+
+.tkw-bd-tokens {
+    font-family: 'Roboto Mono', monospace;
+    font-weight: 600;
+    flex: 0 0 auto;
+}
+
+/* Расширения — чуть отступом, чтобы глазом отделялись от базовых строк */
+.tkw-bd-ext .tkw-bd-label {
+    color: var(--SmartThemeQuoteColor, #e0b0ff);
+}
+
+.tkw-bd-other {
+    opacity: 0.6;
+}
