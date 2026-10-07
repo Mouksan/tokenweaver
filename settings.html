@@ -1,0 +1,114 @@
+<div class="tkw-settings">
+    <div class="inline-drawer">
+        <div class="inline-drawer-toggle inline-drawer-header">
+            <b>Tokenweaver</b>
+            <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+        </div>
+        <div class="inline-drawer-content">
+            <div class="flex-container">
+                <input id="tkw_enabled" type="checkbox" />
+                <label for="tkw_enabled">Enable Monitor</label>
+            </div>
+
+            <hr>
+
+            <div class="flex-container">
+                <label for="tkw_position">Position:</label>
+                <select id="tkw_position" class="text_pole">
+                    <option value="top-right">Top Right</option>
+                    <option value="top-left">Top Left</option>
+                    <option value="bottom-right">Bottom Right</option>
+                    <option value="bottom-left">Bottom Left</option>
+                </select>
+            </div>
+            <div class="flex-container" style="font-size: 0.85em; opacity: 0.65;">
+                <span><i class="fa-solid fa-hand"></i> Drag the indicator to reposition freely. Selecting a corner above resets it.</span>
+            </div>
+
+            <div class="flex-container">
+                <label for="tkw_opacity">Opacity:</label>
+                <input id="tkw_opacity" type="range" min="0.1" max="1" step="0.1" />
+                <span id="tkw_opacity_value">100%</span>
+            </div>
+
+            <div class="flex-container">
+                <label for="tkw_scale">Scale:</label>
+                <input id="tkw_scale" type="range" min="0.5" max="1.5" step="0.1" />
+                <span id="tkw_scale_value">1.0x</span>
+            </div>
+
+            <div class="flex-container">
+                <label for="tkw_bg_color">Background color:</label>
+                <input id="tkw_bg_color" type="color" class="text_pole" style="width: 50px; height: 30px; padding: 0;" />
+            </div>
+
+            <div class="flex-container">
+                <label for="tkw_bg_opacity">Background opacity:</label>
+                <input id="tkw_bg_opacity" type="range" min="0" max="1" step="0.05" />
+                <span id="tkw_bg_opacity_value">85%</span>
+            </div>
+
+            <div class="flex-container">
+                <label for="tkw_border_radius">Corner radius:</label>
+                <input id="tkw_border_radius" type="range" min="0" max="30" step="1" />
+                <span id="tkw_border_radius_value">4px</span>
+            </div>
+
+            <hr>
+
+            <div class="flex-container">
+                <label for="tkw_text_opacity">Text opacity:</label>
+                <input id="tkw_text_opacity" type="range" min="0" max="1" step="0.05" />
+                <span id="tkw_text_opacity_value">100%</span>
+            </div>
+
+            <div class="flex-container">
+                <input id="tkw_use_fixed_text_color" type="checkbox" />
+                <label for="tkw_use_fixed_text_color">Fixed text color (disables % colors)</label>
+            </div>
+
+            <div class="flex-container" id="tkw_fixed_text_color_container">
+                <label for="tkw_text_color">Text color:</label>
+                <input id="tkw_text_color" type="color" class="text_pole" style="width: 50px; height: 30px; padding: 0;" />
+            </div>
+
+            <hr>
+
+            <div class="flex-container">
+                <input id="tkw_show_max" type="checkbox" />
+                <label for="tkw_show_max">Show /max in display</label>
+            </div>
+
+            <div class="flex-container">
+                <input id="tkw_use_custom_max" type="checkbox" />
+                <label for="tkw_use_custom_max">Use custom max context</label>
+            </div>
+
+            <div class="flex-container" id="tkw_custom_max_container">
+                <label for="tkw_custom_max">Custom Max:</label>
+                <input id="tkw_custom_max" type="number" class="text_pole" min="1000" max="1000000" step="1000" placeholder="e.g. 32000" style="width: 120px;" />
+            </div>
+
+            <div class="flex-container">
+                <input id="tkw_show_side" type="checkbox" />
+                <label for="tkw_show_side">Показывать боковые запросы на табло</label>
+            </div>
+
+            <hr>
+
+            <div class="flex-container">
+                <input id="tkw_show_hidden" type="checkbox" />
+                <label for="tkw_show_hidden"><i class="fa-solid fa-ghost"></i> Show hidden counter</label>
+            </div>
+
+            <div class="flex-container">
+                <label for="tkw_hidden_position">Display mode:</label>
+                <select id="tkw_hidden_position" class="text_pole">
+                    <option value="below">Below</option>
+                    <option value="inline">Inline</option>
+                    <option value="separate">Separate</option>
+                </select>
+            </div>
+        </div>
+    </div>
+</div>
