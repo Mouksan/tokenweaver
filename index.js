@@ -14,13 +14,33 @@ const RESET_ON_CHAT_CHANGED = true;
 // Насколько глубоко смотреть стек вызова, чтобы понять, кто отправил запрос.
 const STACK_LIMIT = 60;
 
-// Имя нашей собственной папки — берём из адреса этого файла, как бы папка ни называлась.
-const OWN_FOLDER = decodeURIComponent(new URL(".", import.meta.url).pathname.split("/").filter(Boolean).pop() || "");
+// Сдвиг в пикселях, после которого нажатие на табло считается перетаскиванием, а не кликом.
+const DRAG_THRESHOLD = 5;
+
+// Сколько символов текста показывать в превью сообщения.
+const PREVIEW_LENGTH = 80;
+
+// Подписи ролей в развёрнутом запросе.
+const ROLE_LABELS = {
+    system: "система",
+    user: "юзер",
+    assistant: "модель",
+    tool: "инструмент",
+    prompt: "промт",
+};
+
+const MAIN_SOURCE_LABEL = "Основной ответ";
+const UNKNOWN_SOURCE_LABEL = "Неизвестно";
+
+// Наша собственная папка относительно /scripts/extensions/ (например, "third-party/Tokenweaver").
+const OWN_PATH = decodeURIComponent(
+    new URL(".", import.meta.url).pathname.replace(/^.*\/scripts\/extensions\//, "").replace(/\/$/, ""),
+);
 
 let contextIndicator = null;
 let messageStats = { hidden: 0, total: 0 };
 let chatObserver = null;
-let documentDragHandlersBound = false;
+let documentTouchHandlersBound = false;
 
 // --- Состояние счётчика ---
 let lastMainTokens = 0;          // размер последнего основного запроса
@@ -28,6 +48,16 @@ let sideTokensSinceMain = 0;     // сумма боковых запросов �
 let mainEpoch = 0;               // растёт при каждом новом основном запросе / смене чата
 let mainGenerationActive = false; // запасной признак: таверна начала основную генерацию
 let lastStartedType = null;      // тип последней начатой генерации (normal, swipe, quiet...)
+
+// --- История запросов (только в памяти) ---
+let requestHistory = [];         // новые в начале
+let entryCounter = 0;
+const expandedEntries = new Set();
+const extensionLabelCache = new Map(); // путь папки -> Promise<string>
+
+// --- Окно ---
+let panel = null;
+let panelOpen = false;
 
 const defaultSettings = {
     enabled: true,
@@ -44,6 +74,7 @@ const defaultSettings = {
     customMax: 32000,
     showMax: true,
     showSideOnIndicator: true,
+    historySize: 5,
     showHiddenCounter: true,
     hiddenCounterPosition: "below",
     freePosition: null,
@@ -57,6 +88,21 @@ function hexToRgba(hex, alpha) {
     const g = parseInt(hex.slice(3, 5), 16);
     const b = parseInt(hex.slice(5, 7), 16);
     return `rgba(${r},${g},${b},${alpha})`;
+}
+
+function escapeHtml(value) {
+    return String(value ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+}
+
+function clampHistorySize(value) {
+    const n = parseInt(value);
+    if (!Number.isFinite(n)) return defaultSettings.historySize;
+    return Math.min(20, Math.max(1, n));
 }
 
 // =====================================================================
@@ -78,6 +124,7 @@ async function loadSettings() {
     }
 
     const settings = extension_settings[extensionName];
+    settings.historySize = clampHistorySize(settings.historySize);
 
     $("#tkw_enabled").prop("checked", settings.enabled);
     $("#tkw_position").val(settings.position);
@@ -93,6 +140,7 @@ async function loadSettings() {
     $("#tkw_custom_max").val(settings.customMax);
     $("#tkw_show_max").prop("checked", settings.showMax);
     $("#tkw_show_side").prop("checked", settings.showSideOnIndicator);
+    $("#tkw_history_size").val(settings.historySize);
     $("#tkw_show_hidden").prop("checked", settings.showHiddenCounter);
     $("#tkw_hidden_position").val(settings.hiddenCounterPosition);
 
@@ -124,6 +172,9 @@ function updateSetting(key, value) {
     } else if (key === "useFixedTextColor") {
         toggleFixedTextColor();
         updateContextDisplay();
+    } else if (key === "historySize") {
+        trimHistory();
+        renderPanel();
     } else if (["customMax", "showMax", "showSideOnIndicator", "showHiddenCounter", "textColor", "textOpacity"].includes(key)) {
         updateContextDisplay();
     } else if (key === "hiddenCounterPosition") {
@@ -131,6 +182,7 @@ function updateSetting(key, value) {
         updateContextDisplay();
     } else {
         applyStyles();
+        positionPanel();
     }
 }
 
@@ -185,16 +237,24 @@ function startChatObserver() {
 }
 
 // =====================================================================
-// Табло (как в исходнике, с префиксом tkw)
+// Табло: перетаскивание и клик
 // =====================================================================
 
-function makeDraggable() {
+function makeInteractive() {
     if (!contextIndicator) return;
 
-    let isDragging = false;
+    let pressed = false;
+    let dragging = false;
     let startClientX = 0, startClientY = 0, startElemTop = 0, startElemLeft = 0;
 
-    function dragStart(clientX, clientY) {
+    function press(clientX, clientY) {
+        pressed = true;
+        dragging = false;
+        startClientX = clientX;
+        startClientY = clientY;
+    }
+
+    function beginDrag() {
         const rect = contextIndicator[0].getBoundingClientRect();
         contextIndicator.removeClass(POSITION_CLASSES);
         startElemTop = rect.top;
@@ -206,59 +266,69 @@ function makeDraggable() {
             bottom: "auto",
             "transform-origin": "top left",
         });
-        startClientX = clientX;
-        startClientY = clientY;
-        isDragging = true;
+        dragging = true;
         contextIndicator.addClass("tkw-is-dragging");
     }
 
-    function dragMove(clientX, clientY) {
-        if (!isDragging || !contextIndicator) return;
+    function move(clientX, clientY) {
+        if (!pressed || !contextIndicator) return;
+        if (!dragging) {
+            const distance = Math.hypot(clientX - startClientX, clientY - startClientY);
+            if (distance < DRAG_THRESHOLD) return;
+            beginDrag();
+        }
         const scale = extension_settings[extensionName].scale || 1;
         const newTop = startElemTop + (clientY - startClientY) / scale;
         const newLeft = startElemLeft + (clientX - startClientX) / scale;
         contextIndicator.css({ top: newTop + "px", left: newLeft + "px" });
+        positionPanel();
     }
 
-    function dragEnd() {
-        if (!isDragging || !contextIndicator) return;
-        isDragging = false;
-        contextIndicator.removeClass("tkw-is-dragging");
-        const rect = contextIndicator[0].getBoundingClientRect();
-        extension_settings[extensionName].freePosition = { x: rect.left, y: rect.top };
-        saveSettingsDebounced();
+    function release() {
+        if (!pressed || !contextIndicator) return;
+        pressed = false;
+        if (dragging) {
+            dragging = false;
+            contextIndicator.removeClass("tkw-is-dragging");
+            const rect = contextIndicator[0].getBoundingClientRect();
+            extension_settings[extensionName].freePosition = { x: rect.left, y: rect.top };
+            saveSettingsDebounced();
+            positionPanel();
+        } else {
+            togglePanel();
+        }
     }
 
     contextIndicator.on("mousedown.tkw-drag", function (e) {
         if (e.button !== 0) return;
         e.preventDefault();
-        dragStart(e.clientX, e.clientY);
+        press(e.clientX, e.clientY);
     });
 
     contextIndicator[0].addEventListener("touchstart", function (e) {
         if (e.touches.length !== 1) return;
         e.preventDefault();
         const touch = e.touches[0];
-        dragStart(touch.clientX, touch.clientY);
+        press(touch.clientX, touch.clientY);
     }, { passive: false });
 
     // Обработчики на document — пересоздаём вместе с табло, чтобы они смотрели на актуальное.
     $(document).off(".tkw-drag");
-    $(document).on("mousemove.tkw-drag", (e) => dragMove(e.clientX, e.clientY));
-    $(document).on("mouseup.tkw-drag", () => dragEnd());
+    $(document).on("mousemove.tkw-drag", (e) => move(e.clientX, e.clientY));
+    $(document).on("mouseup.tkw-drag", () => release());
 
-    window.__tkwDrag = { dragMove, dragEnd, isDragging: () => isDragging };
-    if (!documentDragHandlersBound) {
-        documentDragHandlersBound = true;
+    window.__tkwPointer = { move, release, isPressed: () => pressed, isDragging: () => dragging };
+    if (!documentTouchHandlersBound) {
+        documentTouchHandlersBound = true;
         document.addEventListener("touchmove", function (e) {
-            const d = window.__tkwDrag;
-            if (!d || !d.isDragging() || e.touches.length !== 1) return;
-            e.preventDefault();
+            const p = window.__tkwPointer;
+            if (!p || !p.isPressed() || e.touches.length !== 1) return;
+            if (p.isDragging()) e.preventDefault();
             const touch = e.touches[0];
-            d.dragMove(touch.clientX, touch.clientY);
+            p.move(touch.clientX, touch.clientY);
         }, { passive: false });
         document.addEventListener("touchend", function () {
-            window.__tkwDrag?.dragEnd();
+            window.__tkwPointer?.release();
         });
     }
 }
@@ -268,7 +338,7 @@ function createIndicator() {
     contextIndicator = $('<div id="tkw-indicator">0/0</div>');
     applyStyles();
     $("body").append(contextIndicator);
-    makeDraggable();
+    makeInteractive();
     updateContextDisplay();
 }
 
@@ -279,6 +349,7 @@ function removeIndicator() {
         contextIndicator.remove();
         contextIndicator = null;
     }
+    closePanel();
 }
 
 function applyStyles() {
@@ -366,6 +437,208 @@ function updateContextDisplay() {
 }
 
 // =====================================================================
+// Окно «Контекст»
+// =====================================================================
+
+function togglePanel() {
+    if (panelOpen) closePanel();
+    else openPanel();
+}
+
+function openPanel() {
+    if (!contextIndicator) return;
+    if (!panel) {
+        panel = $(`
+            <div id="tkw-panel">
+                <div class="tkw-panel-header">
+                    <span class="tkw-panel-title">Контекст</span>
+                    <div class="tkw-panel-close fa-solid fa-xmark" title="Закрыть"></div>
+                </div>
+                <div class="tkw-tabs">
+                    <div class="tkw-tab tkw-tab-active" data-tab="history">История</div>
+                </div>
+                <div class="tkw-panel-body"></div>
+            </div>
+        `);
+        panel.on("click", ".tkw-panel-close", closePanel);
+        panel.on("click", ".tkw-row-head", function () {
+            const id = Number($(this).closest(".tkw-row").data("id"));
+            toggleEntry(id);
+        });
+        $("body").append(panel);
+    }
+    panelOpen = true;
+    panel.addClass("tkw-open");
+    renderPanel();
+    positionPanel();
+}
+
+function closePanel() {
+    panelOpen = false;
+    if (panel) panel.removeClass("tkw-open");
+}
+
+// Ставим окно рядом с табло: под ним, если хватает места, иначе над ним.
+function positionPanel() {
+    if (!panelOpen || !panel || !contextIndicator) return;
+
+    const rect = contextIndicator[0].getBoundingClientRect();
+    const viewportW = window.innerWidth;
+    const viewportH = window.innerHeight;
+    const margin = 10;
+    const gap = 8;
+    const width = Math.min(440, viewportW - margin * 2);
+
+    let left = (rect.left + rect.width / 2 > viewportW / 2) ? rect.right - width : rect.left;
+    left = Math.max(margin, Math.min(left, viewportW - width - margin));
+
+    const spaceBelow = viewportH - rect.bottom - gap - margin;
+    const spaceAbove = rect.top - gap - margin;
+
+    const css = { width: width + "px", left: left + "px", right: "auto" };
+    if (spaceBelow >= 220 || spaceBelow >= spaceAbove) {
+        css.top = (rect.bottom + gap) + "px";
+        css.bottom = "auto";
+        css["max-height"] = Math.max(120, spaceBelow) + "px";
+    } else {
+        css.top = "auto";
+        css.bottom = (viewportH - rect.top + gap) + "px";
+        css["max-height"] = Math.max(120, spaceAbove) + "px";
+    }
+    panel.css(css);
+}
+
+function formatTime(date) {
+    return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+function makePreview(text) {
+    const flat = String(text || "").replace(/\s+/g, " ").trim();
+    if (!flat) return "(без текста)";
+    return flat.length > PREVIEW_LENGTH ? flat.slice(0, PREVIEW_LENGTH) + "…" : flat;
+}
+
+function renderEntryDetails(entry) {
+    const rows = entry.messages.map((message, index) => {
+        const role = ROLE_LABELS[message.role] || message.role || "?";
+        const tokens = message.tokens === null ? "…" : message.tokens;
+        return `
+            <div class="tkw-msg">
+                <span class="tkw-msg-role" title="${escapeHtml(message.role)}">${escapeHtml(role)}</span>
+                <span class="tkw-msg-tokens" data-entry="${entry.id}" data-msg="${index}">${tokens}</span>
+                <span class="tkw-msg-preview">${escapeHtml(makePreview(message.text))}</span>
+            </div>`;
+    }).join("");
+
+    return `
+        <div class="tkw-row-details">
+            <div class="tkw-row-chat">Чат: ${escapeHtml(entry.chatName || "—")}</div>
+            ${rows || '<div class="tkw-msg-empty">(сообщений нет)</div>'}
+        </div>`;
+}
+
+function renderPanel() {
+    if (!panelOpen || !panel) return;
+    const body = panel.find(".tkw-panel-body");
+    const scrollTop = body.scrollTop();
+
+    if (requestHistory.length === 0) {
+        body.html('<div class="tkw-empty">Запросов пока не было — сгенерируй что-нибудь</div>');
+        return;
+    }
+
+    const html = requestHistory.map(entry => {
+        const expanded = expandedEntries.has(entry.id);
+        const tokens = entry.totalTokens === null ? "…" : entry.totalTokens;
+        return `
+            <div class="tkw-row ${entry.isMain ? "tkw-row-main" : ""} ${expanded ? "tkw-row-expanded" : ""}" data-id="${entry.id}">
+                <div class="tkw-row-head" title="Чат: ${escapeHtml(entry.chatName || "—")}">
+                    <span class="tkw-row-chevron fa-solid ${expanded ? "fa-chevron-down" : "fa-chevron-right"}"></span>
+                    <span class="tkw-row-time">${formatTime(entry.time)}</span>
+                    <span class="tkw-row-source">${escapeHtml(entry.sourceLabel)}</span>
+                    <span class="tkw-row-model" title="${escapeHtml(entry.model)}">${escapeHtml(entry.model || "—")}</span>
+                    <span class="tkw-row-tokens">${tokens}</span>
+                </div>
+                ${expanded ? renderEntryDetails(entry) : ""}
+            </div>`;
+    }).join("");
+
+    body.html(html);
+    body.scrollTop(scrollTop);
+}
+
+function toggleEntry(id) {
+    if (expandedEntries.has(id)) {
+        expandedEntries.delete(id);
+    } else {
+        expandedEntries.add(id);
+        const entry = requestHistory.find(e => e.id === id);
+        if (entry) countEntryMessages(entry);
+    }
+    renderPanel();
+}
+
+// Токены по каждому сообщению считаем только когда запрос развернули — и только один раз.
+async function countEntryMessages(entry) {
+    if (entry.messagesCounting || entry.messagesCounted) return;
+    entry.messagesCounting = true;
+    try {
+        for (let i = 0; i < entry.messages.length; i++) {
+            const message = entry.messages[i];
+            if (message.tokens !== null) continue;
+            message.tokens = message.text ? await countTokens(message.text) : 0;
+            if (panel) panel.find(`.tkw-msg-tokens[data-entry="${entry.id}"][data-msg="${i}"]`).text(message.tokens);
+        }
+        entry.messagesCounted = true;
+    } catch (e) {
+        console.error(LOG, "Per-message token count failed:", e);
+    } finally {
+        entry.messagesCounting = false;
+    }
+}
+
+// =====================================================================
+// История запросов
+// =====================================================================
+
+function trimHistory() {
+    const size = clampHistorySize(extension_settings[extensionName].historySize);
+    if (requestHistory.length > size) {
+        for (const removed of requestHistory.slice(size)) expandedEntries.delete(removed.id);
+        requestHistory = requestHistory.slice(0, size);
+    }
+}
+
+function currentChatName() {
+    try {
+        const context = getContext();
+        if (typeof context?.getCurrentChatId === "function") return context.getCurrentChatId() || "";
+        return context?.chatId || "";
+    } catch {
+        return "";
+    }
+}
+
+// Человеческое имя расширения из его manifest.json, с кэшем.
+function getExtensionLabel(path) {
+    if (!extensionLabelCache.has(path)) {
+        const fallback = path.split("/").pop();
+        const promise = fetch(`/scripts/extensions/${path}/manifest.json`)
+            .then(response => (response.ok ? response.json() : null))
+            .then(manifest => (manifest?.display_name ? String(manifest.display_name) : fallback))
+            .catch(() => fallback);
+        extensionLabelCache.set(path, promise);
+    }
+    return extensionLabelCache.get(path);
+}
+
+function addHistoryEntry(entry) {
+    requestHistory.unshift(entry);
+    trimHistory();
+    renderPanel();
+}
+
+// =====================================================================
 // Перехват запросов: основной ответ vs боковые
 // =====================================================================
 
@@ -397,13 +670,17 @@ function messageText(message) {
     return "";
 }
 
-// Весь текст запроса, или null, если это не запрос к модели (например, генерация картинки).
-function extractRequestText(data) {
+// Сообщения запроса, или null, если это не запрос к модели (например, генерация картинки).
+function extractRequestMessages(data) {
     if (Array.isArray(data?.messages)) {
-        return data.messages.map(messageText).join("\n");
+        return data.messages.map(message => ({
+            role: String(message?.role || ""),
+            text: messageText(message),
+            tokens: null,
+        }));
     }
     if (typeof data?.prompt === "string") {
-        return data.prompt;
+        return [{ role: "prompt", text: data.prompt, tokens: null }];
     }
     return null;
 }
@@ -425,16 +702,23 @@ function stackHasFunction(stack, name) {
     return new RegExp(`(?:\\bat (?:async )?|^|\\*)${name}(?: \\(|@)`, "m").test(stack);
 }
 
-// Папки расширений (встроенных и сторонних) в стеке, кроме нашей.
-function foreignExtensionFolders(stack) {
-    const folders = new Set();
-    const re = /\/scripts\/extensions\/(?:third-party\/)?([^/\s:)]+)\//g;
+// Папки расширений (встроенных и сторонних) в стеке, кроме нашей, сверху вниз.
+function foreignExtensionPaths(stack) {
+    const paths = [];
+    const re = /\/scripts\/extensions\/((?:third-party\/)?[^/\s:)]+)\//g;
     let match;
     while ((match = re.exec(stack)) !== null) {
-        const folder = decodeURIComponent(match[1]);
-        if (folder !== OWN_FOLDER && folder !== "third-party") folders.add(folder);
+        const path = decodeURIComponent(match[1]);
+        if (path !== OWN_PATH && path !== "third-party" && !paths.includes(path)) paths.push(path);
     }
-    return folders;
+    return paths;
+}
+
+// Кто отправил боковой запрос: самое нижнее чужое расширение в стеке — это инициатор,
+// а не какая-нибудь обёртка над fetch, которая оказалась между ним и нами.
+function detectSourcePath(stack) {
+    const paths = foreignExtensionPaths(stack);
+    return paths.length ? paths[paths.length - 1] : null;
 }
 
 // Решаем, основной это запрос или боковой. Признаки по убыванию надёжности.
@@ -454,7 +738,7 @@ function classifyRequest(data, stack) {
     }
 
     // 3. Запасной вариант: таверна объявила основную генерацию, а в стеке нет чужих расширений.
-    const isMain = mainGenerationActive && foreignExtensionFolders(stack).size === 0;
+    const isMain = mainGenerationActive && foreignExtensionPaths(stack).length === 0;
     return { isMain, via: "event" };
 }
 
@@ -484,36 +768,54 @@ function inspectRequest(args) {
         return;
     }
 
-    const text = extractRequestText(data);
-    if (text === null) return;
+    const messages = extractRequestMessages(data);
+    if (messages === null) return;
+    const text = messages.map(m => m.text).join("\n");
 
     // Стек снимаем сразу, синхронно — пока видно, кто нас вызвал.
     const stack = captureStack();
     const { isMain, via } = classifyRequest(data, stack);
+    const sourcePath = isMain ? null : detectSourcePath(stack);
 
+    const entry = {
+        id: ++entryCounter,
+        time: new Date(),
+        chatName: currentChatName(),
+        isMain,
+        sourceLabel: isMain ? MAIN_SOURCE_LABEL : (sourcePath ? sourcePath.split("/").pop() : UNKNOWN_SOURCE_LABEL),
+        model: typeof data?.model === "string" ? data.model : "",
+        messages,
+        totalTokens: null,
+        messagesCounting: false,
+        messagesCounted: false,
+    };
+    addHistoryEntry(entry);
+
+    if (sourcePath) {
+        getExtensionLabel(sourcePath).then(label => {
+            entry.sourceLabel = label;
+            renderPanel();
+        });
+    }
+
+    console.debug(LOG, isMain ? "main request" : "side request", { url, via, source: sourcePath });
+
+    const epoch = isMain ? ++mainEpoch : mainEpoch;
     if (isMain) {
         mainGenerationActive = false;
-        mainEpoch++;
         sideTokensSinceMain = 0;
-        const epoch = mainEpoch;
-        console.debug(LOG, "main request", { url, via });
         updateContextDisplay();
-
-        countTokens(text).then(tokens => {
-            if (epoch !== mainEpoch) return; // уже пришёл более свежий основной запрос
-            lastMainTokens = tokens;
-            updateContextDisplay();
-        }).catch(e => console.error(LOG, "Token count failed:", e));
-    } else {
-        const epoch = mainEpoch;
-        console.debug(LOG, "side request", { url, via, extensions: [...foreignExtensionFolders(stack)] });
-
-        countTokens(text).then(tokens => {
-            if (epoch !== mainEpoch) return; // относится к прошлому посту — не смешиваем
-            sideTokensSinceMain += tokens;
-            updateContextDisplay();
-        }).catch(e => console.error(LOG, "Token count failed:", e));
     }
+
+    countTokens(text).then(tokens => {
+        entry.totalTokens = tokens;
+        renderPanel();
+
+        if (epoch !== mainEpoch) return; // уже пришёл более свежий основной запрос / сменился чат
+        if (isMain) lastMainTokens = tokens;
+        else sideTokensSinceMain += tokens;
+        updateContextDisplay();
+    }).catch(e => console.error(LOG, "Token count failed:", e));
 }
 
 function installFetchInterceptor() {
@@ -614,6 +916,12 @@ function bindSettingsHandlers() {
         updateSetting("showSideOnIndicator", $(this).prop("checked"));
     });
 
+    $("#tkw_history_size").on("change", function () {
+        const val = clampHistorySize($(this).val());
+        $(this).val(val);
+        updateSetting("historySize", val);
+    });
+
     $("#tkw_show_hidden").on("input", function () {
         updateSetting("showHiddenCounter", $(this).prop("checked"));
     });
@@ -650,6 +958,11 @@ function bindEvents() {
         mainGenerationActive = false;
         updateContextDisplay();
         startChatObserver();
+    });
+
+    $(window).on("resize.tkw", positionPanel);
+    $(document).on("keydown.tkw", (e) => {
+        if (e.key === "Escape" && panelOpen) closePanel();
     });
 }
 

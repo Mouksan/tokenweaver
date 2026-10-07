@@ -53,3 +53,191 @@
 .tkw-settings input[type="range"] {
     flex-grow: 1;
 }
+
+/* =====================================================================
+   Окно «Контекст» — цвета берём из темы таверны
+   ===================================================================== */
+
+#tkw-panel {
+    position: fixed;
+    z-index: 20001;
+    display: none;
+    flex-direction: column;
+    overflow: hidden;
+    background: var(--SmartThemeBlurTintColor, rgba(20, 20, 24, 0.95));
+    color: var(--SmartThemeBodyColor, #ddd);
+    border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.15));
+    border-radius: 10px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+    backdrop-filter: blur(var(--SmartThemeBlurStrength, 10px));
+    font-size: 13px;
+}
+
+#tkw-panel.tkw-open {
+    display: flex;
+}
+
+.tkw-panel-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.1));
+}
+
+.tkw-panel-title {
+    font-weight: 600;
+    font-size: 14px;
+}
+
+.tkw-panel-close {
+    cursor: pointer;
+    opacity: 0.6;
+    padding: 2px 4px;
+}
+
+.tkw-panel-close:hover {
+    opacity: 1;
+}
+
+.tkw-tabs {
+    display: flex;
+    gap: 4px;
+    padding: 6px 12px 0;
+}
+
+.tkw-tab {
+    padding: 4px 10px;
+    border-radius: 6px 6px 0 0;
+    cursor: pointer;
+    opacity: 0.6;
+}
+
+.tkw-tab-active {
+    opacity: 1;
+    font-weight: 600;
+    border-bottom: 2px solid var(--SmartThemeQuoteColor, #e0b0ff);
+}
+
+.tkw-panel-body {
+    overflow-y: auto;
+    padding: 6px 8px 8px;
+    min-height: 0;
+    flex: 1 1 auto;
+}
+
+.tkw-empty {
+    padding: 18px 8px;
+    text-align: center;
+    opacity: 0.6;
+}
+
+.tkw-row {
+    border-radius: 6px;
+    margin-bottom: 2px;
+}
+
+.tkw-row-expanded {
+    background: rgba(255, 255, 255, 0.04);
+}
+
+.tkw-row-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 5px 6px;
+    border-radius: 6px;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.tkw-row-head:hover {
+    background: rgba(255, 255, 255, 0.06);
+}
+
+.tkw-row-chevron {
+    font-size: 10px;
+    opacity: 0.5;
+    width: 10px;
+}
+
+.tkw-row-time {
+    font-family: 'Roboto Mono', monospace;
+    opacity: 0.6;
+    font-size: 12px;
+}
+
+.tkw-row-source {
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 150px;
+}
+
+.tkw-row-main .tkw-row-source {
+    color: var(--SmartThemeQuoteColor, #e0b0ff);
+}
+
+.tkw-row-model {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    opacity: 0.55;
+    font-size: 12px;
+}
+
+.tkw-row-tokens {
+    font-family: 'Roboto Mono', monospace;
+    font-weight: 600;
+    text-align: right;
+    min-width: 50px;
+}
+
+.tkw-row-details {
+    padding: 2px 8px 8px 24px;
+}
+
+.tkw-row-chat {
+    opacity: 0.55;
+    font-size: 12px;
+    margin-bottom: 4px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.tkw-msg {
+    display: flex;
+    gap: 8px;
+    align-items: baseline;
+    padding: 2px 0;
+    font-size: 12px;
+    white-space: nowrap;
+}
+
+.tkw-msg-role {
+    width: 62px;
+    flex: 0 0 auto;
+    opacity: 0.7;
+}
+
+.tkw-msg-tokens {
+    width: 48px;
+    flex: 0 0 auto;
+    text-align: right;
+    font-family: 'Roboto Mono', monospace;
+}
+
+.tkw-msg-preview {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    opacity: 0.6;
+}
+
+.tkw-msg-empty {
+    opacity: 0.5;
+    font-size: 12px;
+}
