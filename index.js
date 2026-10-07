@@ -75,6 +75,7 @@ const defaultSettings = {
     showMax: true,
     showSideOnIndicator: true,
     historySize: 5,
+    excludedSources: [], // [{ path: "third-party/Frameweaver", label: "Frameweaver" }]
     showHiddenCounter: true,
     hiddenCounterPosition: "below",
     freePosition: null,
@@ -119,12 +120,13 @@ async function loadSettings() {
 
     for (const key in defaultSettings) {
         if (extension_settings[extensionName][key] === undefined) {
-            extension_settings[extensionName][key] = defaultSettings[key];
+            extension_settings[extensionName][key] = structuredClone(defaultSettings[key]);
         }
     }
 
     const settings = extension_settings[extensionName];
     settings.historySize = clampHistorySize(settings.historySize);
+    if (!Array.isArray(settings.excludedSources)) settings.excludedSources = [];
 
     $("#tkw_enabled").prop("checked", settings.enabled);
     $("#tkw_position").val(settings.position);
@@ -152,6 +154,7 @@ async function loadSettings() {
 
     toggleCustomMaxField();
     toggleFixedTextColor();
+    renderExcludedList();
 }
 
 function toggleCustomMaxField() {
@@ -461,6 +464,12 @@ function openPanel() {
             </div>
         `);
         panel.on("click", ".tkw-panel-close", closePanel);
+        panel.on("click", ".tkw-row-exclude", function (e) {
+            e.stopPropagation();
+            const id = Number($(this).closest(".tkw-row").data("id"));
+            const entry = requestHistory.find(item => item.id === id);
+            if (entry?.sourcePath) excludeSource(entry.sourcePath, entry.sourceLabel);
+        });
         panel.on("click", ".tkw-row-head", function () {
             const id = Number($(this).closest(".tkw-row").data("id"));
             toggleEntry(id);
@@ -558,6 +567,7 @@ function renderPanel() {
                     <span class="tkw-row-source">${escapeHtml(entry.sourceLabel)}</span>
                     <span class="tkw-row-model" title="${escapeHtml(entry.model)}">${escapeHtml(entry.model || "—")}</span>
                     <span class="tkw-row-tokens">${tokens}</span>
+                    ${entry.sourcePath ? '<span class="tkw-row-exclude fa-solid fa-eye-slash" title="Не отслеживать это расширение"></span>' : '<span class="tkw-row-exclude-spacer"></span>'}
                 </div>
                 ${expanded ? renderEntryDetails(entry) : ""}
             </div>`;
@@ -595,6 +605,58 @@ async function countEntryMessages(entry) {
     } finally {
         entry.messagesCounting = false;
     }
+}
+
+// =====================================================================
+// Фильтр «Не отслеживать»
+// =====================================================================
+
+function isExcluded(path) {
+    if (!path) return false;
+    return extension_settings[extensionName].excludedSources.some(item => item.path === path);
+}
+
+function excludeSource(path, label) {
+    const settings = extension_settings[extensionName];
+    if (!isExcluded(path)) {
+        settings.excludedSources.push({ path, label: label || path.split("/").pop() });
+        saveSettingsDebounced();
+    }
+
+    // Убираем его записи из истории прямо сейчас.
+    requestHistory = requestHistory.filter(entry => {
+        if (entry.sourcePath !== path) return true;
+        expandedEntries.delete(entry.id);
+        return false;
+    });
+
+    renderPanel();
+    renderExcludedList();
+    toastr.info(`${label || path} больше не отслеживается. Вернуть можно в настройках Tokenweaver`);
+}
+
+function restoreSource(path) {
+    const settings = extension_settings[extensionName];
+    settings.excludedSources = settings.excludedSources.filter(item => item.path !== path);
+    saveSettingsDebounced();
+    renderExcludedList();
+}
+
+function renderExcludedList() {
+    const container = $("#tkw_excluded_list");
+    if (!container.length) return;
+
+    const list = extension_settings[extensionName].excludedSources;
+    if (!list.length) {
+        container.html('<div class="tkw-excluded-empty">Пока никого. Скрыть расширение можно иконкой глаза в окне истории.</div>');
+        return;
+    }
+
+    container.html(list.map(item => `
+        <div class="tkw-excluded-item">
+            <span class="tkw-excluded-name" title="${escapeHtml(item.path)}">${escapeHtml(item.label)}</span>
+            <div class="menu_button tkw-restore" data-path="${escapeHtml(item.path)}">Вернуть</div>
+        </div>`).join(""));
 }
 
 // =====================================================================
@@ -777,11 +839,17 @@ function inspectRequest(args) {
     const { isMain, via } = classifyRequest(data, stack);
     const sourcePath = isMain ? null : detectSourcePath(stack);
 
+    if (!isMain && isExcluded(sourcePath)) {
+        console.debug(LOG, "ignored request (excluded)", { url, source: sourcePath });
+        return;
+    }
+
     const entry = {
         id: ++entryCounter,
         time: new Date(),
         chatName: currentChatName(),
         isMain,
+        sourcePath,
         sourceLabel: isMain ? MAIN_SOURCE_LABEL : (sourcePath ? sourcePath.split("/").pop() : UNKNOWN_SOURCE_LABEL),
         model: typeof data?.model === "string" ? data.model : "",
         messages,
@@ -920,6 +988,10 @@ function bindSettingsHandlers() {
         const val = clampHistorySize($(this).val());
         $(this).val(val);
         updateSetting("historySize", val);
+    });
+
+    $("#tkw_excluded_list").on("click", ".tkw-restore", function () {
+        restoreSource(String($(this).data("path")));
     });
 
     $("#tkw_show_hidden").on("input", function () {
