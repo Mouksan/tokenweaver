@@ -75,6 +75,9 @@ const extensionLabelCache = new Map(); // путь папки -> Promise<string>
 // --- Разбивка последнего основного запроса ---
 let lastBreakdown = null; // { epoch, status: "counting" | "ready" | "unsupported", total, lines, other, messagesInContext }
 
+// Что таверна знала о чате в момент сборки последнего промта (ловим событием перед отправкой).
+let pendingPromptInfo = null;
+
 // --- Модули таверны, которые грузим динамически (если их нет — работаем без них) ---
 let stTokenizers = null;
 let stOpenAI = null;
@@ -929,8 +932,45 @@ async function countChatMessages(messages) {
     return total;
 }
 
+// Сколько сообщений чата таверна могла отправить и сколько user/assistant сообщений
+// Prompt Manager реально положил в блок истории. Вызывается на событии готовности промта.
+function capturePromptInfo() {
+    try {
+        const chat = getContext()?.chat || [];
+        // Так же, как таверна отбирает сообщения для промта: скрытые не идут, кроме вызовов инструментов.
+        const eligible = chat.filter(m => !m?.is_system || Array.isArray(m?.extra?.tool_invocations)).length;
+
+        let historyCount = null;
+        const root = stOpenAI?.promptManager?.messages;
+        const historyCollection = root?.getCollection?.().find(item => item?.identifier === HISTORY_PROMPT_ID);
+        if (historyCollection?.getCollection) {
+            historyCount = historyCollection.getCollection()
+                .filter(m => m?.role === "user" || m?.role === "assistant").length;
+        }
+
+        return { eligible, historyCount };
+    } catch (e) {
+        console.error(LOG, "Prompt info capture failed:", e);
+        return null;
+    }
+}
+
+// Сообщения чата в контексте: нескрытые сообщения, которые ушли в запрос
+// (при свайпе переписываемое не уходит), но не больше, чем влезло в блок истории.
+function resolveChatMessagesInContext(requestType) {
+    const info = pendingPromptInfo;
+    pendingPromptInfo = null;
+    if (!info) return null;
+
+    let eligible = info.eligible;
+    if (requestType === "swipe") eligible -= 1;
+    eligible = Math.max(0, eligible);
+
+    return info.historyCount === null ? eligible : Math.min(eligible, info.historyCount);
+}
+
 // Снимок того, что таверна знала о промте в момент отправки основного запроса.
-function snapshotPromptState() {
+function snapshotPromptState(requestType) {
     try {
         const context = getContext();
         if (context?.mainApi !== "openai") return null;
@@ -947,7 +987,7 @@ function snapshotPromptState() {
                 filter: typeof prompt.filter === "function" ? prompt.filter : null,
             }));
 
-        const messagesInContext = typeof stOpenAI?.openai_messages_count === "number" ? stOpenAI.openai_messages_count : null;
+        const messagesInContext = resolveChatMessagesInContext(requestType);
 
         return { counts: { ...counts }, extensionPrompts, messagesInContext };
     } catch (e) {
@@ -1017,7 +1057,7 @@ async function computeBreakdown(snapshot, total) {
             kind: "base",
             label: "История чата",
             tokens: history,
-            note: snapshot.messagesInContext !== null ? `сообщений в контексте: ${snapshot.messagesInContext}` : "",
+            note: snapshot.messagesInContext !== null ? `сообщений чата: ${snapshot.messagesInContext}` : "",
         });
     }
 
@@ -1100,7 +1140,7 @@ function inspectRequest(args) {
     console.debug(LOG, isMain ? "main request" : "side request", { url, via, source: sourcePath });
 
     // Снимок промта берём синхронно, пока таверна не пересчитала его для чего-нибудь ещё.
-    const snapshot = isMain && isChatCompletion ? snapshotPromptState() : null;
+    const snapshot = isMain && isChatCompletion ? snapshotPromptState(data?.type) : null;
 
     const epoch = isMain ? ++mainEpoch : mainEpoch;
     if (isMain) {
@@ -1255,6 +1295,10 @@ function bindEvents() {
         if (dryRun) return;
         lastStartedType = type;
         if (type !== "quiet") mainGenerationActive = true;
+    });
+    eventSource.on(event_types.CHAT_COMPLETION_PROMPT_READY, (eventData) => {
+        if (eventData?.dryRun) return;
+        pendingPromptInfo = capturePromptInfo();
     });
     eventSource.on(event_types.GENERATION_ENDED, () => {
         mainGenerationActive = false;
