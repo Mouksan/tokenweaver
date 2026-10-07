@@ -87,6 +87,7 @@ let stExtensions = null;
 let panel = null;
 let panelOpen = false;
 let activeTab = "breakdown";
+let viewer = null; // окно «Полный текст»
 let editingNameKeys = null; // пока переименовываем строку разбивки, окно не перерисовываем
 
 const defaultSettings = {
@@ -503,6 +504,13 @@ function openPanel() {
             </div>
         `);
         panel.on("click", ".tkw-panel-close", closePanel);
+        panel.on("click", ".tkw-bd-view", function (e) {
+            e.stopPropagation();
+            openInjectionViewer($(this).closest(".tkw-bd-line"));
+        });
+        panel.on("click", ".tkw-msg", function () {
+            openMessageViewer(Number($(this).data("entry")), Number($(this).data("msg")));
+        });
         panel.on("click", ".tkw-bd-edit", function (e) {
             e.stopPropagation();
             startRename($(this).closest(".tkw-bd-line"));
@@ -532,6 +540,7 @@ function openPanel() {
 }
 
 function closePanel() {
+    closeViewer();
     panelOpen = false;
     if (panel) panel.removeClass("tkw-open");
 }
@@ -581,7 +590,7 @@ function renderEntryDetails(entry) {
         const role = ROLE_LABELS[message.role] || message.role || "?";
         const tokens = message.tokens === null ? "…" : message.tokens;
         return `
-            <div class="tkw-msg">
+            <div class="tkw-msg" data-entry="${entry.id}" data-msg="${index}" title="Показать целиком">
                 <span class="tkw-msg-role" title="${escapeHtml(message.role)}">${escapeHtml(role)}</span>
                 <span class="tkw-msg-tokens" data-entry="${entry.id}" data-msg="${index}">${tokens}</span>
                 <span class="tkw-msg-preview">${escapeHtml(makePreview(message.text))}</span>
@@ -654,6 +663,7 @@ function renderBreakdown(body) {
         <div class="tkw-bd-line tkw-bd-ext" data-keys="${escapeHtml(JSON.stringify(group.keys))}">
             <span class="tkw-bd-label" title="${escapeHtml(keysTitle)}">${escapeHtml(group.label)}</span>
             <span class="tkw-bd-right">
+                <span class="tkw-bd-view fa-solid fa-maximize" title="Показать текст"></span>
                 <span class="tkw-bd-edit fa-solid fa-pencil" title="Переименовать"></span>
                 ${tokensCell(group.tokens)}
             </span>
@@ -706,7 +716,7 @@ function startRename(line) {
     const input = $('<input type="text" class="text_pole tkw-bd-input" />').val(labelEl.text().trim());
     editingNameKeys = keys;
     labelEl.replaceWith(input);
-    line.find(".tkw-bd-edit").hide();
+    line.find(".tkw-bd-edit, .tkw-bd-view").hide();
     input.trigger("focus").trigger("select");
 
     input.on("keydown", (e) => {
@@ -799,6 +809,99 @@ async function countEntryMessages(entry) {
     } finally {
         entry.messagesCounting = false;
     }
+}
+
+// =====================================================================
+// Окно «Полный текст»
+// =====================================================================
+
+function isViewerOpen() {
+    return !!viewer && viewer.hasClass("tkw-open");
+}
+
+function closeViewer() {
+    if (viewer) viewer.removeClass("tkw-open");
+}
+
+// sections: [{ heading?: string, text: string }]
+function openViewer(title, sections, notice = "") {
+    if (!viewer) {
+        viewer = $(`
+            <div id="tkw-viewer">
+                <div class="tkw-viewer-header">
+                    <span class="tkw-viewer-title"></span>
+                    <div class="tkw-viewer-actions">
+                        <div class="menu_button tkw-viewer-copy"><i class="fa-solid fa-copy"></i> Копировать</div>
+                        <div class="tkw-viewer-close fa-solid fa-xmark" title="Закрыть"></div>
+                    </div>
+                </div>
+                <div class="tkw-viewer-body"></div>
+            </div>
+        `);
+        viewer.on("click", ".tkw-viewer-close", closeViewer);
+        viewer.on("click", ".tkw-viewer-copy", () => copyText(viewer.data("copyText") || ""));
+        $("body").append(viewer);
+    }
+
+    viewer.find(".tkw-viewer-title").text(title);
+    viewer.data("copyText", sections.map(section => section.text).join("\n\n"));
+
+    const html = (notice ? `<div class="tkw-viewer-notice"><i class="fa-solid fa-triangle-exclamation"></i> ${escapeHtml(notice)}</div>` : "")
+        + sections.map(section => `
+            ${section.heading ? `<div class="tkw-viewer-heading">${escapeHtml(section.heading)}</div>` : ""}
+            <pre class="tkw-viewer-text">${escapeHtml(section.text || "(без текста)")}</pre>`).join("");
+
+    viewer.find(".tkw-viewer-body").html(html).scrollTop(0);
+    viewer.addClass("tkw-open");
+}
+
+async function copyText(text) {
+    try {
+        await navigator.clipboard.writeText(text);
+    } catch {
+        // Запасной вариант для браузеров без доступа к буферу
+        const area = $("<textarea>").val(text).css({ position: "fixed", opacity: 0 }).appendTo("body");
+        area[0].select();
+        document.execCommand("copy");
+        area.remove();
+    }
+    toastr.success("Скопировано");
+}
+
+function openMessageViewer(entryId, index) {
+    const entry = requestHistory.find(item => item.id === entryId);
+    const message = entry?.messages?.[index];
+    if (!message) return;
+
+    const role = ROLE_LABELS[message.role] || message.role || "?";
+    const tokens = message.tokens === null ? "…" : message.tokens;
+    openViewer(`${role} · ${tokens}`, [{ text: message.text }]);
+}
+
+function openInjectionViewer(line) {
+    if (!lastBreakdown?.extensionItems) return;
+
+    let keys;
+    try {
+        keys = JSON.parse(line.attr("data-keys") || "[]");
+    } catch {
+        return;
+    }
+
+    const items = lastBreakdown.extensionItems.filter(item => keys.includes(item.key));
+    if (!items.length) return;
+
+    const label = line.find(".tkw-bd-label").text().trim();
+    const tokens = items.reduce((acc, item) => acc + item.tokens, 0);
+    const several = items.length > 1;
+
+    const sections = items.map(item => ({
+        heading: several ? item.key : "",
+        text: item.value,
+    }));
+
+    const identical = several && items.every(item => item.value.trim() === items[0].value.trim());
+    openViewer(`${label} · ${tokens}`, sections, identical ? "Тексты под этими ключами одинаковые" : "");
 }
 
 // =====================================================================
@@ -1183,7 +1286,7 @@ async function computeBreakdown(snapshot, total) {
 
         if (target.kind === "card") card += tokens;
         else if (target.kind === "lore") lore += tokens;
-        else extensionItems.push({ key: prompt.key, tokens, autoLabel: await resolveInjectionLabel(prompt.key) });
+        else extensionItems.push({ key: prompt.key, tokens, value: prompt.value, autoLabel: await resolveInjectionLabel(prompt.key) });
     }
 
     preset = Math.max(0, preset);
@@ -1463,7 +1566,9 @@ function bindEvents() {
 
     $(window).on("resize.tkw", positionPanel);
     $(document).on("keydown.tkw", (e) => {
-        if (e.key === "Escape" && panelOpen) closePanel();
+        if (e.key !== "Escape") return;
+        if (isViewerOpen()) closeViewer();
+        else if (panelOpen) closePanel();
     });
 }
 
